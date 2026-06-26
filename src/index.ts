@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 
 /**
- * kiro-agent-acp: A Zed ACP adapter for Kiro CLI
+ * kiro-agent-acp: ACP Registry entry point for Kiro CLI
  *
- * This is a transparent proxy that sits between Zed (ACP client) and kiro-cli acp (ACP agent).
- * It intercepts specific ACP messages to inject configuration options for:
- * - Model selection (Auto, Sonnet, Opus, Haiku, DeepSeek, Qwen, etc.)
- * - Agent/mode switching (Default, Architect, Ask, Code)
- * - Thinking/effort level control (Low, Medium, High, Max)
+ * This is a thin transparent wrapper around `kiro-cli acp`.
+ * It exists to provide a convenient npx-installable package for the ACP Registry,
+ * so editors like Zed and JetBrains can install Kiro with one click.
  *
- * All other ACP messages pass through transparently.
+ * kiro-cli acp already handles everything natively:
+ * - Model selection (configOptions with category "model")
+ * - Agent switching (configOptions with category "mode")
+ * - Thinking/effort level (configOptions with category "thought_level")
+ * - Session management, tool calls, slash commands, etc.
+ *
+ * All ACP messages pass through this proxy transparently.
  */
 
 import { KiroAcpProxy } from "./proxy.js";
@@ -17,7 +21,10 @@ import { KiroAcpProxy } from "./proxy.js";
 // Parse CLI arguments
 const agentArg = getArgValue("--agent");
 
-const proxy = new KiroAcpProxy({ agent: agentArg });
+// Collect any extra args to pass through to kiro-cli acp
+const extraArgs = getExtraArgs();
+
+const proxy = new KiroAcpProxy({ agent: agentArg, extraArgs });
 
 process.on("SIGTERM", () => {
   proxy.shutdown();
@@ -30,7 +37,7 @@ process.on("SIGINT", () => {
 });
 
 process.on("unhandledRejection", (reason) => {
-  process.stderr.write(`[kiro-acp-proxy] Unhandled rejection: ${reason}\n`);
+  process.stderr.write(`[kiro-agent-acp] Unhandled rejection: ${reason}\n`);
 });
 
 // Start the proxy
@@ -42,4 +49,11 @@ function getArgValue(flag: string): string | undefined {
   const idx = process.argv.indexOf(flag);
   if (idx === -1 || idx + 1 >= process.argv.length) return undefined;
   return process.argv[idx + 1];
+}
+
+function getExtraArgs(): string[] {
+  // Pass through any args after -- to kiro-cli acp
+  const separatorIdx = process.argv.indexOf("--");
+  if (separatorIdx === -1) return [];
+  return process.argv.slice(separatorIdx + 1);
 }
