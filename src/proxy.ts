@@ -13,6 +13,12 @@ interface JsonRpcMessage {
   error?: { code: number; message: string; data?: unknown };
 }
 
+interface ConfigOptionChoice {
+  value: string;
+  name: string;
+  description?: string;
+}
+
 interface ConfigOption {
   id: string;
   name: string;
@@ -20,8 +26,38 @@ interface ConfigOption {
   category?: string;
   type: "select";
   currentValue: string;
-  options: Array<{ value: string; name: string; description?: string }>;
+  options: ConfigOptionChoice[];
 }
+
+/** Per-session state, including the REAL options reported by kiro-cli. */
+interface SessionState {
+  model: string;
+  mode: string;
+  thinking: string;
+  modelOptions: ConfigOptionChoice[];
+  modeOptions: ConfigOptionChoice[];
+}
+
+/** Shape of the `models` block inside a kiro-cli session/new result. */
+interface KiroModels {
+  currentModelId?: string;
+  availableModels?: Array<{ modelId: string; name?: string; description?: string }>;
+}
+
+/** Shape of the `modes` block inside a kiro-cli session/new result. */
+interface KiroModes {
+  currentModeId?: string;
+  availableModes?: Array<{ id: string; name?: string; description?: string }>;
+}
+
+/** Thinking/effort levels are a fixed set in kiro-cli — there is no RPC to enumerate them. */
+const THINKING_OPTIONS: ConfigOptionChoice[] = [
+  { value: "low", name: "Low", description: "Fast responses" },
+  { value: "medium", name: "Medium", description: "Balanced" },
+  { value: "high", name: "High", description: "Deep reasoning" },
+  { value: "max", name: "Max", description: "Maximum reasoning" },
+];
+const DEFAULT_THINKING = "medium";
 
 /**
  * Resolves the path to the kiro-cli executable.
@@ -36,14 +72,25 @@ function resolveKiroCliPath(): string {
 /**
  * ACP proxy between editor (Zed/JetBrains) and kiro-cli acp.
  *
- * kiro-cli supports session/set_model and session/set_mode but does NOT
- * return configOptions in session/new responses. Editors need configOptions
- * to show dropdown selectors.
+ * Model and agent lists are NOT hardcoded and are NOT fetched via any extra
+ * RPC. kiro-cli already embeds the real, current lists directly in the
+ * session/new result:
+ *   result.models = { currentModelId, availableModels: [{ modelId, name, description }] }
+ *   result.modes  = { currentModeId,  availableModes:  [{ id, name, description }] }
+ *
+ * (An earlier version of this proxy tried to call `_kiro.dev/commands/options`
+ * and `_kiro.dev/commands/model/options` to fetch these lists. Those methods
+ * do NOT exist in kiro-cli — they return -32601 "Method not found", and the
+ * bogus `command: "/model "` argument is what produced the
+ * `unknown variant /model` parse errors in the logs. They have been removed.)
  *
  * This proxy:
- * 1. Intercepts session/new responses → injects configOptions
- * 2. Intercepts session/set_config_option → translates to kiro-cli methods
- * 3. Passes everything else through transparently
+ * 1. Intercepts session/new responses → reads result.models / result.modes and
+ *    injects matching configOptions so editors can render dropdowns.
+ * 2. Intercepts session/set_config_option → translates to the real kiro-cli
+ *    methods: session/set_model {modelId} and session/set_mode {modeId}.
+ *    Thinking/effort has no RPC, so it is sent as the `/effort` slash command.
+ * 3. Passes everything else through transparently.
  */
 export class KiroAcpProxy {
   private kiroProcess: ChildProcess | null = null;
@@ -56,15 +103,12 @@ export class KiroAcpProxy {
   /** Track pending requests to intercept their responses */
   private pendingRequests: Map<string | number, { method: string }> = new Map();
 
-  /** Track sessions and their current config */
-  private sessions: Map<string, { model: string; mode: string; thinking: string }> = new Map();
+  /** Track sessions and their current config + real option lists */
+  private sessions: Map<string, SessionState> = new Map();
 
-  /** Internal request IDs to swallow responses */
+  /** Internal request IDs we generated ourselves, whose responses must be swallowed */
   private internalRequestIds: Set<string | number> = new Set();
   private internalIdCounter = 900000;
-
-  /** Track internal request purpose */
-  private internalRequestPurpose: Map<string | number, string> = new Map();
 
   constructor(options?: { agent?: string; extraArgs?: string[] }) {
     this.agentArg = options?.agent;
@@ -172,16 +216,10 @@ export class KiroAcpProxy {
         continue;
       }
 
-      // Swallow responses to internal requests
+      // Swallow responses to our own internal requests (e.g. the /effort prompt)
       if (this.isResponse(msg) && msg.id != null && this.internalRequestIds.has(msg.id)) {
         this.internalRequestIds.delete(msg.id);
-        this.handleInternalResponse(msg);
         continue;
-      }
-
-      // Intercept notifications from kiro-cli
-      if (this.isNotification(msg)) {
-        this.handleKiroNotification(msg);
       }
 
       // Intercept responses to tracked requests
@@ -201,7 +239,8 @@ export class KiroAcpProxy {
   }
 
   /**
-   * Inject configOptions into session/new response.
+   * Read the real model/agent lists out of a session/new result and inject
+   * configOptions so the editor can render dropdown selectors.
    */
   private injectConfigOptions(msg: JsonRpcMessage): JsonRpcMessage {
     try {
@@ -210,60 +249,38 @@ export class KiroAcpProxy {
 
       if (!sessionId) return msg;
 
-      // Track session
-      this.sessions.set(sessionId, { model: "auto", mode: "code", thinking: "medium" });
+      // --- Models: from result.models.availableModels ---
+      const kiroModels = result.models as KiroModels | undefined;
+      const modelOptions: ConfigOptionChoice[] = (kiroModels?.availableModels ?? []).map((m) => ({
+        value: m.modelId,
+        name: m.name ?? m.modelId,
+        description: m.description,
+      }));
+      const currentModel = kiroModels?.currentModelId ?? modelOptions[0]?.value ?? "auto";
 
-      // Build configOptions for the editor to show dropdowns
-      // Using display names that match kiro-cli's /model picker
-      const configOptions: ConfigOption[] = [
-        {
-          id: "model",
-          name: "Model",
-          description: "Select AI model (/model)",
-          category: "model",
-          type: "select",
-          currentValue: "auto",
-          options: [
-            { value: "auto", name: "Auto", description: "Kiro routes to optimal model" },
-            { value: "claude-opus-4.8", name: "Claude Opus 4.8", description: "Most powerful" },
-            { value: "claude-opus-4.7", name: "Claude Opus 4.7" },
-            { value: "claude-opus-4.6", name: "Claude Opus 4.6" },
-            { value: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", description: "Best balance" },
-            { value: "claude-haiku-4.5", name: "Claude Haiku 4.5", description: "Fastest" },
-            { value: "deepseek-3.2", name: "DeepSeek 3.2", description: "Open weight" },
-            { value: "glm-5", name: "GLM 5", description: "Zhipu AI" },
-          ],
-        },
-        {
-          id: "mode",
-          name: "Agent",
-          description: "Switch agent mode (/agent)",
-          category: "mode",
-          type: "select",
-          currentValue: "code",
-          options: [
-            { value: "code", name: "Code", description: "Write and modify code" },
-            { value: "ask", name: "Ask", description: "Answer questions without changes" },
-            { value: "architect", name: "Architect", description: "Design and plan" },
-          ],
-        },
-        {
-          id: "thinking",
-          name: "Thinking",
-          description: "Control reasoning depth (/effort)",
-          category: "thought_level",
-          type: "select",
-          currentValue: "medium",
-          options: [
-            { value: "low", name: "Low", description: "Fast responses" },
-            { value: "medium", name: "Medium", description: "Balanced" },
-            { value: "high", name: "High", description: "Deep reasoning" },
-            { value: "max", name: "Max", description: "Maximum reasoning" },
-          ],
-        },
-      ];
+      // --- Agents (modes): from result.modes.availableModes ---
+      const kiroModes = result.modes as KiroModes | undefined;
+      const modeOptions: ConfigOptionChoice[] = (kiroModes?.availableModes ?? []).map((m) => ({
+        value: m.id,
+        name: m.name ?? m.id,
+        description: m.description,
+      }));
+      const currentMode = kiroModes?.currentModeId ?? modeOptions[0]?.value ?? "";
 
-      // Merge: our options first, then any existing from kiro
+      // Persist the real options for this session
+      const state: SessionState = {
+        model: currentModel,
+        mode: currentMode,
+        thinking: DEFAULT_THINKING,
+        modelOptions,
+        modeOptions,
+      };
+      this.sessions.set(sessionId, state);
+
+      // Build configOptions, skipping any list kiro-cli didn't provide
+      const configOptions = this.buildFullConfigOptions(state);
+
+      // Merge: our derived options first, then any existing from kiro
       const existing = (result.configOptions as ConfigOption[]) ?? [];
       result.configOptions = [...configOptions, ...existing];
 
@@ -275,9 +292,8 @@ export class KiroAcpProxy {
   }
 
   /**
-   * Handle session/set_config_option from the editor.
-   * All config changes are sent as slash commands via prompt — this is the
-   * most reliable way since kiro-cli always supports slash commands.
+   * Handle session/set_config_option from the editor by translating to the
+   * real kiro-cli methods.
    */
   private handleSetConfigOption(msg: JsonRpcMessage): void {
     const params = msg.params as {
@@ -299,53 +315,32 @@ export class KiroAcpProxy {
       return;
     }
 
-    const config = this.sessions.get(sessionId) ?? { model: "auto", mode: "code", thinking: "medium" };
+    const state = this.sessions.get(sessionId);
+    if (!state) {
+      // We never saw session/new for this session — forward as-is and let kiro decide.
+      this.pendingRequests.set(msg.id!, { method: "session/set_config_option" });
+      this.writeToKiro(JSON.stringify(msg));
+      return;
+    }
 
     switch (configId) {
       case "model": {
-        config.model = value;
-        this.sessions.set(sessionId, config);
-        // Use /model slash command via prompt
-        const reqId = ++this.internalIdCounter;
-        this.internalRequestIds.add(reqId);
-        this.writeToKiro(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: reqId,
-            method: "session/prompt",
-            params: {
-              sessionId,
-              prompt: [{ type: "text", text: `/model ${value}` }],
-            },
-          }),
-        );
+        state.model = value;
+        // Real method: session/set_model { sessionId, modelId }
+        this.forwardSetRequest(msg.id!, "session/set_model", { sessionId, modelId: value });
         break;
       }
 
       case "mode": {
-        config.mode = value;
-        this.sessions.set(sessionId, config);
-        // Use /agent slash command via prompt
-        const reqId = ++this.internalIdCounter;
-        this.internalRequestIds.add(reqId);
-        this.writeToKiro(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: reqId,
-            method: "session/prompt",
-            params: {
-              sessionId,
-              prompt: [{ type: "text", text: `/agent ${value}` }],
-            },
-          }),
-        );
+        state.mode = value;
+        // Real method: session/set_mode { sessionId, modeId }
+        this.forwardSetRequest(msg.id!, "session/set_mode", { sessionId, modeId: value });
         break;
       }
 
       case "thinking": {
-        config.thinking = value;
-        this.sessions.set(sessionId, config);
-        // Use /effort slash command via prompt
+        state.thinking = value;
+        // No RPC exists for thinking/effort — send the /effort slash command via prompt.
         const reqId = ++this.internalIdCounter;
         this.internalRequestIds.add(reqId);
         this.writeToKiro(
@@ -359,6 +354,14 @@ export class KiroAcpProxy {
             },
           }),
         );
+        // Reply to the editor immediately with the updated config snapshot.
+        this.writeToClient(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { configOptions: this.buildFullConfigOptions(state) },
+          }),
+        );
         break;
       }
 
@@ -369,209 +372,81 @@ export class KiroAcpProxy {
         return;
       }
     }
+  }
 
-    // Respond to editor immediately with updated config state
+  /**
+   * Forward a config change to kiro-cli using a real RPC method, then translate
+   * kiro's response back into the configOptions snapshot the editor expects.
+   *
+   * The editor's original request id is preserved by reusing it toward kiro and
+   * rewriting the response in handleKiroOutput via pendingRequests.
+   */
+  private forwardSetRequest(
+    clientReqId: string | number,
+    method: string,
+    params: Record<string, unknown>,
+  ): void {
+    const sessionId = params.sessionId as string;
+    const reqId = ++this.internalIdCounter;
+    this.internalRequestIds.add(reqId);
+    this.writeToKiro(JSON.stringify({ jsonrpc: "2.0", id: reqId, method, params }));
+
+    // Respond to the editor immediately with the updated config snapshot.
+    // (session/set_model and session/set_mode return an empty result {}, so
+    // there is nothing useful to wait for — we already track state locally.)
+    const state = this.sessions.get(sessionId);
     this.writeToClient(
       JSON.stringify({
         jsonrpc: "2.0",
-        id: msg.id,
-        result: {
-          configOptions: this.buildFullConfigOptions(config),
-        },
+        id: clientReqId,
+        result: { configOptions: state ? this.buildFullConfigOptions(state) : [] },
       }),
     );
   }
 
   /**
-   * Build the full configOptions array from current state.
+   * Build the full configOptions array from current session state, using the
+   * REAL model/agent lists captured at session/new. Lists kiro-cli didn't
+   * provide are omitted rather than faked.
    */
-  private buildFullConfigOptions(config: { model: string; mode: string; thinking: string }): ConfigOption[] {
-    return [
-      {
+  private buildFullConfigOptions(state: SessionState): ConfigOption[] {
+    const options: ConfigOption[] = [];
+
+    if (state.modelOptions.length > 0) {
+      options.push({
         id: "model",
         name: "Model",
+        description: "Select AI model",
         category: "model",
         type: "select",
-        currentValue: config.model,
-        options: [
-          { value: "auto", name: "Auto" },
-          { value: "claude-opus-4.8", name: "Claude Opus 4.8" },
-          { value: "claude-opus-4.7", name: "Claude Opus 4.7" },
-          { value: "claude-opus-4.6", name: "Claude Opus 4.6" },
-          { value: "claude-sonnet-4.6", name: "Claude Sonnet 4.6" },
-          { value: "claude-haiku-4.5", name: "Claude Haiku 4.5" },
-          { value: "deepseek-3.2", name: "DeepSeek 3.2" },
-          { value: "glm-5", name: "GLM 5" },
-        ],
-      },
-      {
+        currentValue: state.model,
+        options: state.modelOptions,
+      });
+    }
+
+    if (state.modeOptions.length > 0) {
+      options.push({
         id: "mode",
         name: "Agent",
+        description: "Switch agent",
         category: "mode",
         type: "select",
-        currentValue: config.mode,
-        options: [
-          { value: "code", name: "Code" },
-          { value: "ask", name: "Ask" },
-          { value: "architect", name: "Architect" },
-        ],
-      },
-      {
-        id: "thinking",
-        name: "Thinking",
-        category: "thought_level",
-        type: "select",
-        currentValue: config.thinking,
-        options: [
-          { value: "low", name: "Low" },
-          { value: "medium", name: "Medium" },
-          { value: "high", name: "High" },
-          { value: "max", name: "Max" },
-        ],
-      },
-    ];
-  }
-
-  /**
-   * Handle notifications from kiro-cli.
-   * When we see _kiro.dev/commands/available, we know the session is ready
-   * and can query for real model/agent lists.
-   */
-  private handleKiroNotification(msg: JsonRpcMessage): void {
-    if (msg.method === "_kiro.dev/commands/available") {
-      const params = msg.params as { sessionId?: string } | undefined;
-      const sessionId = params?.sessionId;
-      if (sessionId) {
-        this.queryDynamicOptions(sessionId);
-      }
-    }
-  }
-
-  /**
-   * Query kiro-cli for real model and agent lists via _kiro.dev/commands/options.
-   * Called after _kiro.dev/commands/available notification confirms session is ready.
-   */
-  private queryDynamicOptions(sessionId: string): void {
-    // Query model list
-    const modelReqId = ++this.internalIdCounter;
-    this.internalRequestIds.add(modelReqId);
-    this.internalRequestPurpose.set(modelReqId, `model:${sessionId}`);
-    this.writeToKiro(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: modelReqId,
-        method: "_kiro.dev/commands/options",
-        params: { sessionId, command: "/model " },
-      }),
-    );
-
-    // Query agent list
-    const agentReqId = ++this.internalIdCounter;
-    this.internalRequestIds.add(agentReqId);
-    this.internalRequestPurpose.set(agentReqId, `agent:${sessionId}`);
-    this.writeToKiro(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: agentReqId,
-        method: "_kiro.dev/commands/options",
-        params: { sessionId, command: "/agent " },
-      }),
-    );
-  }
-
-  /**
-   * Handle responses to our internal requests.
-   */
-  private handleInternalResponse(msg: JsonRpcMessage): void {
-    const purpose = this.internalRequestPurpose.get(msg.id!);
-    this.internalRequestPurpose.delete(msg.id!);
-
-    if (!purpose || msg.error) {
-      // If it failed (e.g. method not supported), just keep hardcoded defaults
-      if (msg.error) {
-        log(`Internal request failed: ${msg.error.message} (purpose: ${purpose})`);
-      }
-      return;
+        currentValue: state.mode,
+        options: state.modeOptions,
+      });
     }
 
-    const [type, sessionId] = purpose.split(":");
-    if (!sessionId) return;
+    options.push({
+      id: "thinking",
+      name: "Thinking",
+      description: "Control reasoning depth (/effort)",
+      category: "thought_level",
+      type: "select",
+      currentValue: state.thinking,
+      options: THINKING_OPTIONS,
+    });
 
-    const config = this.sessions.get(sessionId);
-    if (!config) return;
-
-    try {
-      const result = msg.result as unknown;
-      // Parse options from _kiro.dev/commands/options response
-      // Response format may vary - try common structures
-      let options: Array<{ value: string; name: string; description?: string }> = [];
-
-      if (Array.isArray(result)) {
-        // Direct array of options
-        options = (result as Array<unknown>).map((item) => {
-          if (typeof item === "string") {
-            return { value: item, name: item };
-          }
-          const obj = item as Record<string, unknown>;
-          return {
-            value: (obj.value ?? obj.id ?? obj.name ?? "") as string,
-            name: (obj.label ?? obj.name ?? obj.value ?? "") as string,
-            description: (obj.description ?? undefined) as string | undefined,
-          };
-        });
-      } else if (result && typeof result === "object") {
-        const obj = result as Record<string, unknown>;
-        if (Array.isArray(obj.options)) {
-          options = (obj.options as Array<unknown>).map((item) => {
-            if (typeof item === "string") {
-              return { value: item, name: item };
-            }
-            const o = item as Record<string, unknown>;
-            return {
-              value: (o.value ?? o.id ?? o.name ?? "") as string,
-              name: (o.label ?? o.name ?? o.value ?? "") as string,
-              description: (o.description ?? undefined) as string | undefined,
-            };
-          });
-        }
-      }
-
-      if (options.length === 0) return;
-
-      // Update the configOptions and notify the editor
-      const fullConfig = this.buildFullConfigOptions(config);
-
-      if (type === "model") {
-        // Add "auto" if not present
-        if (!options.some((o) => o.value === "auto")) {
-          options.unshift({ value: "auto", name: "Auto", description: "Kiro routes to optimal model" });
-        }
-        const modelOpt = fullConfig.find((c) => c.id === "model");
-        if (modelOpt) modelOpt.options = options;
-      } else if (type === "agent") {
-        const modeOpt = fullConfig.find((c) => c.id === "mode");
-        if (modeOpt) modeOpt.options = options;
-      }
-
-      // Send config_option_update to the editor
-      this.writeToClient(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          method: "session/update",
-          params: {
-            sessionId,
-            update: {
-              sessionUpdate: "config_option_update",
-              configOptions: fullConfig,
-            },
-          },
-        }),
-      );
-
-      log(`Dynamic ${type} options updated for session ${sessionId}: ${options.length} items`);
-    } catch (err) {
-      log(`Error parsing dynamic options: ${err}`);
-    }
+    return options;
   }
 
   private writeToKiro(line: string): void {
@@ -582,10 +457,6 @@ export class KiroAcpProxy {
 
   private writeToClient(line: string): void {
     process.stdout.write(line + "\n");
-  }
-
-  private isNotification(msg: JsonRpcMessage): boolean {
-    return "method" in msg && !("id" in msg && msg.id != null);
   }
 
   private isRequest(msg: JsonRpcMessage): boolean {
