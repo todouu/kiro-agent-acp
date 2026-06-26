@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A Zed ACP adapter for Kiro CLI with model/agent/thinking selection",
   "main": "dist/lib.js",
   "types": "dist/lib.d.ts",
