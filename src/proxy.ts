@@ -57,7 +57,7 @@ export class KiroAcpProxy {
   private pendingRequests: Map<string | number, { method: string }> = new Map();
 
   /** Track sessions and their current config */
-  private sessions: Map<string, { model: string; thinking: string }> = new Map();
+  private sessions: Map<string, { model: string; mode: string; thinking: string }> = new Map();
 
   /** Internal request IDs to swallow responses */
   private internalRequestIds: Set<string | number> = new Set();
@@ -202,24 +202,38 @@ export class KiroAcpProxy {
       if (!sessionId) return msg;
 
       // Track session
-      this.sessions.set(sessionId, { model: "auto", thinking: "medium" });
+      this.sessions.set(sessionId, { model: "auto", mode: "code", thinking: "medium" });
 
       // Build configOptions for the editor to show dropdowns
+      // Using display names that match kiro-cli's /model picker
       const configOptions: ConfigOption[] = [
         {
           id: "model",
           name: "Model",
-          description: "Select AI model",
+          description: "Select AI model (/model)",
           category: "model",
           type: "select",
           currentValue: "auto",
           options: [
             { value: "auto", name: "Auto", description: "Kiro routes to optimal model" },
-            { value: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
-            { value: "claude-opus-4", name: "Claude Opus 4" },
-            { value: "claude-haiku-4", name: "Claude Haiku 4" },
-            { value: "deepseek-r1", name: "DeepSeek R1" },
-            { value: "qwen-3", name: "Qwen 3" },
+            { value: "sonnet", name: "Claude Sonnet", description: "Best balance of speed and capability" },
+            { value: "opus", name: "Claude Opus", description: "Most powerful for complex tasks" },
+            { value: "haiku", name: "Claude Haiku", description: "Fastest and most efficient" },
+            { value: "deepseek", name: "DeepSeek", description: "Open weight reasoning model" },
+            { value: "qwen", name: "Qwen", description: "Efficient for long sessions" },
+          ],
+        },
+        {
+          id: "mode",
+          name: "Agent",
+          description: "Switch agent mode (/agent)",
+          category: "mode",
+          type: "select",
+          currentValue: "code",
+          options: [
+            { value: "code", name: "Code", description: "Write and modify code" },
+            { value: "ask", name: "Ask", description: "Answer questions without changes" },
+            { value: "architect", name: "Architect", description: "Design and plan" },
           ],
         },
         {
@@ -242,18 +256,6 @@ export class KiroAcpProxy {
       const existing = (result.configOptions as ConfigOption[]) ?? [];
       result.configOptions = [...configOptions, ...existing];
 
-      // Also inject modes if kiro didn't provide them
-      if (!result.modes) {
-        result.modes = {
-          currentModeId: "code",
-          availableModes: [
-            { id: "code", name: "Code", description: "Write and modify code" },
-            { id: "ask", name: "Ask", description: "Answer questions without changes" },
-            { id: "architect", name: "Architect", description: "Design and plan" },
-          ],
-        };
-      }
-
       return { ...msg, result };
     } catch (err) {
       log(`Error injecting configOptions: ${err}`);
@@ -263,6 +265,8 @@ export class KiroAcpProxy {
 
   /**
    * Handle session/set_config_option from the editor.
+   * All config changes are sent as slash commands via prompt — this is the
+   * most reliable way since kiro-cli always supports slash commands.
    */
   private handleSetConfigOption(msg: JsonRpcMessage): void {
     const params = msg.params as {
@@ -284,21 +288,44 @@ export class KiroAcpProxy {
       return;
     }
 
-    const config = this.sessions.get(sessionId) ?? { model: "auto", thinking: "medium" };
+    const config = this.sessions.get(sessionId) ?? { model: "auto", mode: "code", thinking: "medium" };
 
     switch (configId) {
       case "model": {
         config.model = value;
         this.sessions.set(sessionId, config);
-        // Send session/set_model to kiro-cli
+        // Use /model slash command via prompt
         const reqId = ++this.internalIdCounter;
         this.internalRequestIds.add(reqId);
         this.writeToKiro(
           JSON.stringify({
             jsonrpc: "2.0",
             id: reqId,
-            method: "session/set_model",
-            params: { sessionId, modelId: value },
+            method: "session/prompt",
+            params: {
+              sessionId,
+              prompt: [{ type: "text", text: `/model ${value}` }],
+            },
+          }),
+        );
+        break;
+      }
+
+      case "mode": {
+        config.mode = value;
+        this.sessions.set(sessionId, config);
+        // Use /agent slash command via prompt
+        const reqId = ++this.internalIdCounter;
+        this.internalRequestIds.add(reqId);
+        this.writeToKiro(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: reqId,
+            method: "session/prompt",
+            params: {
+              sessionId,
+              prompt: [{ type: "text", text: `/agent ${value}` }],
+            },
           }),
         );
         break;
@@ -307,7 +334,7 @@ export class KiroAcpProxy {
       case "thinking": {
         config.thinking = value;
         this.sessions.set(sessionId, config);
-        // Send /effort via prompt (safest way)
+        // Use /effort slash command via prompt
         const reqId = ++this.internalIdCounter;
         this.internalRequestIds.add(reqId);
         this.writeToKiro(
@@ -338,39 +365,58 @@ export class KiroAcpProxy {
         jsonrpc: "2.0",
         id: msg.id,
         result: {
-          configOptions: [
-            {
-              id: "model",
-              name: "Model",
-              category: "model",
-              type: "select",
-              currentValue: config.model,
-              options: [
-                { value: "auto", name: "Auto" },
-                { value: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
-                { value: "claude-opus-4", name: "Claude Opus 4" },
-                { value: "claude-haiku-4", name: "Claude Haiku 4" },
-                { value: "deepseek-r1", name: "DeepSeek R1" },
-                { value: "qwen-3", name: "Qwen 3" },
-              ],
-            },
-            {
-              id: "thinking",
-              name: "Thinking",
-              category: "thought_level",
-              type: "select",
-              currentValue: config.thinking,
-              options: [
-                { value: "low", name: "Low" },
-                { value: "medium", name: "Medium" },
-                { value: "high", name: "High" },
-                { value: "max", name: "Max" },
-              ],
-            },
-          ],
+          configOptions: this.buildFullConfigOptions(config),
         },
       }),
     );
+  }
+
+  /**
+   * Build the full configOptions array from current state.
+   */
+  private buildFullConfigOptions(config: { model: string; mode: string; thinking: string }): ConfigOption[] {
+    return [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: config.model,
+        options: [
+          { value: "auto", name: "Auto" },
+          { value: "sonnet", name: "Claude Sonnet" },
+          { value: "opus", name: "Claude Opus" },
+          { value: "haiku", name: "Claude Haiku" },
+          { value: "deepseek", name: "DeepSeek" },
+          { value: "qwen", name: "Qwen" },
+        ],
+      },
+      {
+        id: "mode",
+        name: "Agent",
+        category: "mode",
+        type: "select",
+        currentValue: config.mode,
+        options: [
+          { value: "code", name: "Code" },
+          { value: "ask", name: "Ask" },
+          { value: "architect", name: "Architect" },
+        ],
+      },
+      {
+        id: "thinking",
+        name: "Thinking",
+        category: "thought_level",
+        type: "select",
+        currentValue: config.thinking,
+        options: [
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
+          { value: "max", name: "Max" },
+        ],
+      },
+    ];
   }
 
   private writeToKiro(line: string): void {
