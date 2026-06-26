@@ -55,6 +55,7 @@ const THINKING_OPTIONS: ConfigOptionChoice[] = [
   { value: "low", name: "Low", description: "Fast responses" },
   { value: "medium", name: "Medium", description: "Balanced" },
   { value: "high", name: "High", description: "Deep reasoning" },
+  { value: "xhigh", name: "XHigh", description: "Extended reasoning" },
   { value: "max", name: "Max", description: "Maximum reasoning" },
 ];
 const DEFAULT_THINKING = "medium";
