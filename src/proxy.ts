@@ -63,6 +63,9 @@ export class KiroAcpProxy {
   private internalRequestIds: Set<string | number> = new Set();
   private internalIdCounter = 900000;
 
+  /** Track internal request purpose */
+  private internalRequestPurpose: Map<string | number, string> = new Map();
+
   constructor(options?: { agent?: string; extraArgs?: string[] }) {
     this.agentArg = options?.agent;
     this.extraArgs = options?.extraArgs ?? [];
@@ -172,7 +175,13 @@ export class KiroAcpProxy {
       // Swallow responses to internal requests
       if (this.isResponse(msg) && msg.id != null && this.internalRequestIds.has(msg.id)) {
         this.internalRequestIds.delete(msg.id);
+        this.handleInternalResponse(msg);
         continue;
+      }
+
+      // Intercept notifications from kiro-cli
+      if (this.isNotification(msg)) {
+        this.handleKiroNotification(msg);
       }
 
       // Intercept responses to tracked requests
@@ -423,6 +432,148 @@ export class KiroAcpProxy {
     ];
   }
 
+  /**
+   * Handle notifications from kiro-cli.
+   * When we see _kiro.dev/commands/available, we know the session is ready
+   * and can query for real model/agent lists.
+   */
+  private handleKiroNotification(msg: JsonRpcMessage): void {
+    if (msg.method === "_kiro.dev/commands/available") {
+      const params = msg.params as { sessionId?: string } | undefined;
+      const sessionId = params?.sessionId;
+      if (sessionId) {
+        this.queryDynamicOptions(sessionId);
+      }
+    }
+  }
+
+  /**
+   * Query kiro-cli for real model and agent lists via _kiro.dev/commands/options.
+   * Called after _kiro.dev/commands/available notification confirms session is ready.
+   */
+  private queryDynamicOptions(sessionId: string): void {
+    // Query model list
+    const modelReqId = ++this.internalIdCounter;
+    this.internalRequestIds.add(modelReqId);
+    this.internalRequestPurpose.set(modelReqId, `model:${sessionId}`);
+    this.writeToKiro(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: modelReqId,
+        method: "_kiro.dev/commands/options",
+        params: { sessionId, command: "/model " },
+      }),
+    );
+
+    // Query agent list
+    const agentReqId = ++this.internalIdCounter;
+    this.internalRequestIds.add(agentReqId);
+    this.internalRequestPurpose.set(agentReqId, `agent:${sessionId}`);
+    this.writeToKiro(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: agentReqId,
+        method: "_kiro.dev/commands/options",
+        params: { sessionId, command: "/agent " },
+      }),
+    );
+  }
+
+  /**
+   * Handle responses to our internal requests.
+   */
+  private handleInternalResponse(msg: JsonRpcMessage): void {
+    const purpose = this.internalRequestPurpose.get(msg.id!);
+    this.internalRequestPurpose.delete(msg.id!);
+
+    if (!purpose || msg.error) {
+      // If it failed (e.g. method not supported), just keep hardcoded defaults
+      if (msg.error) {
+        log(`Internal request failed: ${msg.error.message} (purpose: ${purpose})`);
+      }
+      return;
+    }
+
+    const [type, sessionId] = purpose.split(":");
+    if (!sessionId) return;
+
+    const config = this.sessions.get(sessionId);
+    if (!config) return;
+
+    try {
+      const result = msg.result as unknown;
+      // Parse options from _kiro.dev/commands/options response
+      // Response format may vary - try common structures
+      let options: Array<{ value: string; name: string; description?: string }> = [];
+
+      if (Array.isArray(result)) {
+        // Direct array of options
+        options = (result as Array<unknown>).map((item) => {
+          if (typeof item === "string") {
+            return { value: item, name: item };
+          }
+          const obj = item as Record<string, unknown>;
+          return {
+            value: (obj.value ?? obj.id ?? obj.name ?? "") as string,
+            name: (obj.label ?? obj.name ?? obj.value ?? "") as string,
+            description: (obj.description ?? undefined) as string | undefined,
+          };
+        });
+      } else if (result && typeof result === "object") {
+        const obj = result as Record<string, unknown>;
+        if (Array.isArray(obj.options)) {
+          options = (obj.options as Array<unknown>).map((item) => {
+            if (typeof item === "string") {
+              return { value: item, name: item };
+            }
+            const o = item as Record<string, unknown>;
+            return {
+              value: (o.value ?? o.id ?? o.name ?? "") as string,
+              name: (o.label ?? o.name ?? o.value ?? "") as string,
+              description: (o.description ?? undefined) as string | undefined,
+            };
+          });
+        }
+      }
+
+      if (options.length === 0) return;
+
+      // Update the configOptions and notify the editor
+      const fullConfig = this.buildFullConfigOptions(config);
+
+      if (type === "model") {
+        // Add "auto" if not present
+        if (!options.some((o) => o.value === "auto")) {
+          options.unshift({ value: "auto", name: "Auto", description: "Kiro routes to optimal model" });
+        }
+        const modelOpt = fullConfig.find((c) => c.id === "model");
+        if (modelOpt) modelOpt.options = options;
+      } else if (type === "agent") {
+        const modeOpt = fullConfig.find((c) => c.id === "mode");
+        if (modeOpt) modeOpt.options = options;
+      }
+
+      // Send config_option_update to the editor
+      this.writeToClient(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: "config_option_update",
+              configOptions: fullConfig,
+            },
+          },
+        }),
+      );
+
+      log(`Dynamic ${type} options updated for session ${sessionId}: ${options.length} items`);
+    } catch (err) {
+      log(`Error parsing dynamic options: ${err}`);
+    }
+  }
+
   private writeToKiro(line: string): void {
     if (this.kiroProcess?.stdin?.writable) {
       this.kiroProcess.stdin.write(line + "\n");
@@ -431,6 +582,10 @@ export class KiroAcpProxy {
 
   private writeToClient(line: string): void {
     process.stdout.write(line + "\n");
+  }
+
+  private isNotification(msg: JsonRpcMessage): boolean {
+    return "method" in msg && !("id" in msg && msg.id != null);
   }
 
   private isRequest(msg: JsonRpcMessage): boolean {
