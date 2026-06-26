@@ -1,44 +1,43 @@
 #!/usr/bin/env node
 
-import { runAcp } from "./kiro-acp-agent.js";
+/**
+ * kiro-agent-acp: A Zed ACP adapter for Kiro CLI
+ *
+ * This is a transparent proxy that sits between Zed (ACP client) and kiro-cli acp (ACP agent).
+ * It intercepts specific ACP messages to inject configuration options for:
+ * - Model selection (Auto, Sonnet, Opus, Haiku, DeepSeek, Qwen, etc.)
+ * - Agent/mode switching (Default, Architect, Ask, Code)
+ * - Thinking/effort level control (Low, Medium, High, Max)
+ *
+ * All other ACP messages pass through transparently.
+ */
+
+import { KiroAcpProxy } from "./proxy.js";
 
 // Parse CLI arguments
-const agentName = getArgValue("--agent");
+const agentArg = getArgValue("--agent");
 
-// stdout is used to send messages to the client (JSON-RPC)
-// Redirect all console output to stderr to avoid interfering with ACP
-console.log = console.error;
-console.info = console.error;
-console.warn = console.error;
-console.debug = console.error;
+const proxy = new KiroAcpProxy({ agent: agentArg });
 
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+process.on("SIGTERM", () => {
+  proxy.shutdown();
+  process.exit(0);
 });
 
-const { connection, agent } = runAcp({ agentName });
-
-async function shutdown() {
-  if (agent) {
-    await agent.dispose().catch((err) => {
-      console.error("Error during cleanup:", err);
-    });
-  }
+process.on("SIGINT", () => {
+  proxy.shutdown();
   process.exit(0);
-}
+});
 
-// Exit cleanly when the ACP connection closes (e.g. stdin EOF)
-connection.closed.then(shutdown);
+process.on("unhandledRejection", (reason) => {
+  process.stderr.write(`[kiro-acp-proxy] Unhandled rejection: ${reason}\n`);
+});
 
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+// Start the proxy
+proxy.start();
 
-// Keep process alive while connection is open
-process.stdin.resume();
+// -- Helpers --
 
-/**
- * Extract a CLI argument value (e.g., --agent my-agent -> "my-agent")
- */
 function getArgValue(flag: string): string | undefined {
   const idx = process.argv.indexOf(flag);
   if (idx === -1 || idx + 1 >= process.argv.length) return undefined;

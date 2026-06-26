@@ -1,154 +1,134 @@
-# Kiro Agent ACP
+# kiro-agent-acp
 
-Use [Kiro CLI](https://kiro.dev/docs/cli/) from [ACP-compatible](https://agentclientprotocol.com) clients!
+A **Zed ACP adapter** for [Kiro CLI](https://kiro.dev/docs/cli/) that adds model selection, agent switching, and thinking level control.
 
-This package implements an ACP agent by wrapping the official [Kiro CLI](https://kiro.dev/docs/cli/), supporting:
+Since `kiro-cli acp` already implements the Agent Client Protocol natively, this adapter acts as a **transparent proxy** that intercepts specific ACP messages to inject UI configuration options — giving you dropdown selectors in Zed for:
 
-- Context @-mentions
-- Images
-- Tool calls (file edits, terminal execution, search, etc.)
-- Streaming responses
-- Session management
-- Slash commands (`/help`, `/compact`, `/clear`, `/tools`, `/mcp`, `/cost`)
-- MCP server integration
+- **Model** — Switch between Auto, Claude Sonnet 4.5, Claude Opus 4, Claude Haiku 4, DeepSeek R1, Qwen 3
+- **Agent** — Switch between Default, Architect, Ask, Code modes
+- **Thinking** — Control reasoning depth: Low, Medium, High, Max
 
-Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
+All other ACP messages pass through transparently to `kiro-cli acp`.
+
+## How It Works
+
+```
+┌──────────────┐      JSON-RPC/stdio       ┌───────────────────┐      JSON-RPC/stdio      ┌───────────────┐
+│     Zed      │ ◄──────────────────────► │  kiro-agent-acp   │ ◄────────────────────► │  kiro-cli acp │
+│  (ACP Client)│                           │  (this proxy)     │                         │  (ACP Agent)  │
+└──────────────┘                           └───────────────────┘                         └───────────────┘
+                                                    │
+                                                    │ Intercepts:
+                                                    │ • initialize → enhance capabilities
+                                                    │ • session/new response → inject configOptions
+                                                    │ • session/set_config_option → handle model/agent/thinking
+                                                    │   then sends /model, /agent, /effort commands to kiro-cli
+```
+
+The proxy:
+1. Spawns `kiro-cli acp` as a subprocess
+2. Pipes ACP JSON-RPC messages between Zed and kiro-cli
+3. Intercepts `session/new` responses to inject `configOptions` for model, agent, and thinking level
+4. Handles `session/set_config_option` requests by translating them into Kiro slash commands (`/model`, `/effort`, `/agent`)
+5. Passes everything else through unchanged
 
 ## Prerequisites
 
-1. **Kiro CLI** must be installed and authenticated. Follow the [Kiro CLI installation guide](https://kiro.dev/docs/cli/).
+1. **Kiro CLI** installed and authenticated:
+   ```bash
+   # Install
+   curl -fsSL https://kiro.dev/install.sh | bash
+
+   # Authenticate
+   kiro-cli auth login
+   ```
 
 2. **Node.js** >= 20
 
-3. Verify kiro-cli is working:
+3. Verify:
    ```bash
    kiro-cli --version
+   kiro-cli acp --help
    ```
 
 ## Installation
 
 ```bash
-npm install -g @anthropic-ai/kiro-agent-acp
+npm install -g kiro-agent-acp
 ```
 
-Or use directly with npx:
+Or use directly with npx (no install needed):
 
 ```bash
-npx @anthropic-ai/kiro-agent-acp
+npx kiro-agent-acp
 ```
 
-## Usage
+## Zed Editor Setup
 
-Run as an ACP agent (communicates over stdin/stdout with JSON-RPC):
-
-```bash
-kiro-agent-acp
-```
-
-To use a specific Kiro agent configuration:
-
-```bash
-kiro-agent-acp --agent my-agent
-```
-
-## Editor Setup
-
-### Zed
-
-Add the following to your Zed settings (`~/.config/zed/settings.json`):
+Open Zed settings (`~/.config/zed/settings.json`) and add:
 
 ```json
 {
   "agent": {
-    "custom_agents": [
-      {
-        "id": "kiro",
-        "name": "Kiro Agent",
-        "command": {
-          "command": "npx",
-          "args": ["@anthropic-ai/kiro-agent-acp"]
-        }
+    "agent_servers": {
+      "Kiro": {
+        "type": "custom",
+        "command": "npx",
+        "args": ["kiro-agent-acp"],
+        "env": {}
       }
-    ]
+    }
   }
 }
 ```
 
-Or if you installed globally:
+Or if installed globally:
 
 ```json
 {
   "agent": {
-    "custom_agents": [
-      {
-        "id": "kiro",
-        "name": "Kiro Agent",
-        "command": {
-          "command": "kiro-agent-acp",
-          "args": []
-        }
+    "agent_servers": {
+      "Kiro": {
+        "type": "custom",
+        "command": "kiro-agent-acp",
+        "args": [],
+        "env": {}
       }
-    ]
+    }
   }
 }
 ```
 
-### JetBrains IDEs (IntelliJ, WebStorm, DataGrip, etc.)
-
-1. Open the AI Chat tool window
-2. Click the menu button (three dots) in the upper-right corner
-3. Select "Add Custom Agent"
-4. This opens or creates `~/.jetbrains/acp.json`
-5. Add the Kiro agent configuration:
+To use a specific Kiro agent:
 
 ```json
 {
-  "agents": [
-    {
-      "name": "Kiro Agent",
-      "command": ["npx", "@anthropic-ai/kiro-agent-acp"]
+  "agent": {
+    "agent_servers": {
+      "Kiro Architect": {
+        "type": "custom",
+        "command": "npx",
+        "args": ["kiro-agent-acp", "--agent", "architect"],
+        "env": {}
+      }
     }
-  ]
+  }
 }
 ```
 
-Or with a globally installed binary:
+After saving, open the Agent Panel (`Cmd+?` on macOS / `Ctrl+?` on Linux), click **+** to create a new thread, and select **Kiro** from the agent list.
 
-```json
-{
-  "agents": [
-    {
-      "name": "Kiro Agent",
-      "command": ["kiro-agent-acp"]
-    }
-  ]
-}
-```
+## Usage in Zed
 
-6. Save the file — Kiro should appear in the AI Chat dropdown immediately.
+Once configured, you'll see dropdown selectors in the Zed Agent Panel for:
 
-### Neovim (with ACP plugin)
+| Selector | Options | What it does |
+|----------|---------|--------------|
+| **Model** | Auto, Sonnet 4.5, Opus 4, Haiku 4, DeepSeek R1, Qwen 3 | Sends `/model <name>` to kiro-cli |
+| **Agent** | Default, Architect, Ask, Code | Sends `/agent <name>` to kiro-cli |
+| **Thinking** | Low, Medium, High, Max | Sends `/effort <level>` to kiro-cli |
 
-If using an ACP-compatible Neovim plugin, configure in your `init.lua`:
-
-```lua
-require('acp').setup({
-  agents = {
-    {
-      name = "Kiro",
-      command = { "npx", "@anthropic-ai/kiro-agent-acp" },
-    },
-  },
-})
-```
-
-### Eclipse
-
-Configure via your Eclipse ACP settings to spawn:
-
-```
-npx @anthropic-ai/kiro-agent-acp
-```
+These map to ACP's `SessionConfigOption` with categories `model`, `mode`, and `thought_level` respectively — Zed renders them as native UI elements.
 
 ## Environment Variables
 
@@ -156,43 +136,44 @@ npx @anthropic-ai/kiro-agent-acp
 |----------|-------------|
 | `KIRO_CLI_PATH` | Override the path to the `kiro-cli` executable |
 | `KIRO_AUTH_TOKEN` | Pass authentication token directly |
-| `KIRO_NON_INTERACTIVE` | Set to `1` to force non-interactive mode (set automatically) |
 
-## Architecture
+## CLI Options
 
-```
-┌──────────────────┐         JSON-RPC/stdio        ┌──────────────────────┐
-│   ACP Client     │◄────────────────────────────►  │  kiro-agent-acp      │
-│   (Zed, IDEA)    │                                │  (this package)      │
-└──────────────────┘                                └──────────┬───────────┘
-                                                               │
-                                                               │ stdin/stdout
-                                                               ▼
-                                                    ┌──────────────────────┐
-                                                    │     kiro-cli         │
-                                                    │  (subprocess)        │
-                                                    └──────────────────────┘
+```bash
+kiro-agent-acp [--agent <name>]
 ```
 
-The adapter:
-1. Receives ACP protocol messages from the editor (JSON-RPC over stdio)
-2. Manages `kiro-cli` subprocesses — one per session
-3. Translates Kiro's output into ACP `session/update` notifications (message chunks, tool calls, diffs)
-4. Maps slash commands to ACP available commands
+| Flag | Description |
+|------|-------------|
+| `--agent <name>` | Pass `--agent` to kiro-cli acp (use a specific agent config) |
 
-## Supported ACP Methods
+## Also Works With Other ACP Clients
 
-| Method | Support |
-|--------|---------|
-| `initialize` | ✅ |
-| `session/new` | ✅ |
-| `session/prompt` | ✅ |
-| `session/cancel` | ✅ |
-| `session/close` | ✅ |
-| `session/list` | ✅ |
-| `session/load` | ❌ (planned) |
-| `session/resume` | ❌ (planned) |
-| `session/set_mode` | ❌ (planned) |
+While designed for Zed, this adapter works with any ACP client:
+
+### JetBrains IDEs
+
+`~/.jetbrains/acp.json`:
+```json
+{
+  "agents": [
+    {
+      "name": "Kiro",
+      "command": ["npx", "kiro-agent-acp"]
+    }
+  ]
+}
+```
+
+### Neovim (ACP plugin)
+
+```lua
+require('acp').setup({
+  agents = {
+    { name = "Kiro", command = { "npx", "kiro-agent-acp" } },
+  },
+})
+```
 
 ## Development
 
@@ -203,48 +184,38 @@ npm install
 # Build
 npm run build
 
-# Run directly
+# Run directly (will fail without a connected ACP client on stdin)
 npm start
-
-# Run in dev mode (build + run)
-npm run dev
 
 # Type check
 npx tsc --noEmit
-
-# Run tests
-npm test
 ```
 
-## How It Works
+## Customizing Models & Agents
 
-1. **Initialization**: When an ACP client connects, the agent advertises its capabilities (image support, embedded context, session management).
+Edit `src/config.ts` to add/remove models, agents, or thinking levels. Then rebuild:
 
-2. **Session creation**: Each `session/new` request spawns a dedicated `kiro-cli` subprocess in the requested working directory.
-
-3. **Prompt handling**: User messages are sent to kiro-cli's stdin. The agent parses kiro-cli's JSON output stream and emits appropriate ACP notifications:
-   - Text → `agent_message_chunk`
-   - Thinking → `agent_thought_chunk`
-   - Tool calls → `tool_call` / `tool_call_update`
-   - Errors → `agent_message_chunk` with error formatting
-
-4. **Cancellation**: Sends SIGINT to the kiro-cli process to interrupt the current operation.
-
-5. **Cleanup**: When a session is closed, the subprocess is terminated gracefully.
-
-## Library Usage
-
-You can also use this package as a library to build custom integrations:
-
-```typescript
-import { KiroAcpAgent, KiroProcess } from "@anthropic-ai/kiro-agent-acp";
-
-// Create a standalone kiro process
-const proc = new KiroProcess({ cwd: "/my/project", logger: console });
-await proc.start();
-proc.onMessage((msg) => console.log(msg));
-await proc.sendPrompt("Hello, Kiro!");
+```bash
+npm run build
 ```
+
+## Troubleshooting
+
+**"kiro-cli not found"**
+- Run `which kiro-cli` and set `KIRO_CLI_PATH` to the full path
+- Or ensure `~/.local/bin` is in your PATH
+
+**"Authentication required"**
+- Run `kiro-cli auth login` in your terminal
+
+**Zed doesn't show the agent**
+- Make sure the settings.json is valid JSON
+- Restart Zed after changing settings
+- Check `~/.config/zed/logs/` for errors
+
+**Model/thinking selector not appearing**
+- Make sure you're using a recent version of Zed that supports ACP `configOptions`
+- The selectors appear after creating a new thread with the Kiro agent
 
 ## License
 
