@@ -67,6 +67,20 @@ With a specific agent:
 }
 ```
 
+Trusting all tools (no per-tool confirmation prompts):
+```json
+{
+  "agent_servers": {
+    "Kiro": {
+      "type": "custom",
+      "command": "npx",
+      "args": ["kiro-agent-acp", "--trust-all-tools"],
+      "env": {}
+    }
+  }
+}
+```
+
 ## JetBrains IDEs
 
 `~/.jetbrains/acp.json`:
@@ -81,13 +95,14 @@ With a specific agent:
 ## CLI Options
 
 ```bash
-kiro-agent-acp [--agent <name>] [-- <extra-kiro-args>]
+kiro-agent-acp [--agent <name>] [<extra-kiro-args>...] [-- <extra-kiro-args>]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--agent <name>` | Use a specific Kiro agent |
-| `-- <args>` | Extra arguments passed to `kiro-cli acp` |
+| `<extra-kiro-args>` | Any other flags (e.g. `--trust-all-tools`) are forwarded to `kiro-cli acp` |
+| `-- <args>` | Everything after `--` is also forwarded to `kiro-cli acp` |
 
 ## Environment Variables
 
