@@ -21,7 +21,9 @@ import { KiroAcpProxy } from "./proxy.js";
 // Parse CLI arguments
 const agentArg = getArgValue("--agent");
 
-// Collect any extra args to pass through to kiro-cli acp
+// Collect any extra args to pass through to kiro-cli acp.
+// Everything except our own `--agent <name>` flag is forwarded transparently,
+// so flags like `--trust-all-tools` can be placed directly in the editor's args.
 const extraArgs = getExtraArgs();
 
 const proxy = new KiroAcpProxy({ agent: agentArg, extraArgs });
@@ -47,13 +49,40 @@ proxy.start();
 
 function getArgValue(flag: string): string | undefined {
   const idx = process.argv.indexOf(flag);
-  if (idx === -1 || idx + 1 >= process.argv.length) return undefined;
-  return process.argv[idx + 1];
+  if (idx !== -1 && idx + 1 < process.argv.length) {
+    return process.argv[idx + 1];
+  }
+  // Also support the `--flag=value` form.
+  const prefixed = process.argv.find((a) => a.startsWith(`${flag}=`));
+  return prefixed ? prefixed.slice(flag.length + 1) : undefined;
 }
 
 function getExtraArgs(): string[] {
-  // Pass through any args after -- to kiro-cli acp
-  const separatorIdx = process.argv.indexOf("--");
-  if (separatorIdx === -1) return [];
-  return process.argv.slice(separatorIdx + 1);
+  // Drop `node` and the script path, keep only the user-supplied args.
+  const argv = process.argv.slice(2);
+
+  const passthrough: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+
+    // Our own flag — consume it and its value, don't forward it.
+    if (arg === "--agent") {
+      i++; // skip the value
+      continue;
+    }
+    if (arg.startsWith("--agent=")) {
+      continue;
+    }
+
+    // Explicit separator: everything after `--` goes straight to kiro-cli acp.
+    if (arg === "--") {
+      passthrough.push(...argv.slice(i + 1));
+      break;
+    }
+
+    // Anything else (e.g. --trust-all-tools) is forwarded transparently.
+    passthrough.push(arg);
+  }
+
+  return passthrough;
 }
